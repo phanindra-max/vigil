@@ -215,7 +215,9 @@
               {% if item.qr_data %}
               <div class="payload"><strong>QR:</strong> {{ item.qr_data }}</div>
               {% endif %}
-              {% if item.yolo_labels %}
+              {% if item.vision_objects %}
+              <div><strong>Vision:</strong> {{ item.vision_objects | join(", ") }}</div>
+              {% elif item.yolo_labels %}
               <div><strong>YOLO:</strong> {{ item.yolo_labels | join(", ") }}</div>
               {% endif %}
               {% if item.geoint_link %}

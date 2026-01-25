@@ -7,4 +7,6 @@ pillow
 exif
 scikit-image
 colorama
+google-cloud-vision
 easyocr
+python-dotenv

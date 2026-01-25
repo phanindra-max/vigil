@@ -25,5 +25,7 @@ report.html
 report*.html
 yolov8n.pt
 bip39.txt
+gcloud-vision-api.json
+.vision_credentials.json
 
 *.pt

@@ -36,9 +36,41 @@ python main.py Evidence_Dump --report report.html
 Optional:
 - `--bip39 path/to/bip39.txt`
 - `--yolo yolov8n.pt`
+- `--vision` / `--no-vision`
+- `--vision-score 0.4`
 
 ## Notes
 
 - The HTML report embeds thumbnails (no separate assets).
 - For a full BIP39 list, you can pass a local file or the official wordlist URL:
   https://raw.githubusercontent.com/bitcoin/bips/refs/heads/master/bip-0039/english.txt
+
+## Google Vision API (QR + Objects)
+
+1. Create a Google Cloud project with Vision API enabled.
+2. Create a service account key (JSON).
+3. Set environment variable:
+
+```bash
+set GOOGLE_APPLICATION_CREDENTIALS=C:\path\to\service-account.json
+```
+
+Then run with `--vision` (default on). If not configured, the app falls back to QR/YOLO.
+
+You can also set it via `.env`:
+
+```
+GOOGLE_APPLICATION_CREDENTIALS=C:\path\to\service-account.json
+```
+
+If you want to paste the JSON directly into `.env`, use:
+
+```
+GOOGLE_APPLICATION_CREDENTIALS_JSON={"type":"service_account",...}
+```
+
+For safety with multiline values, you can base64-encode it:
+
+```
+GOOGLE_APPLICATION_CREDENTIALS_JSON=base64:PASTE_BASE64_HERE
+```

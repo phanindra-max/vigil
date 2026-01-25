@@ -58,6 +58,16 @@ try:
 except Exception:  # pragma: no cover
     Environment = FileSystemLoader = select_autoescape = None
 
+try:
+    from google.cloud import vision
+except Exception:  # pragma: no cover
+    vision = None
+
+try:
+    from dotenv import load_dotenv
+except Exception:  # pragma: no cover
+    load_dotenv = None
+
 
 SUPPORTED_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".tiff"}
 KEYWORDS = {"confidential", "password", "login", "seed", "recovery"}
@@ -320,6 +330,20 @@ DEFAULT_BIP39 = {
 
 SEVERITY_ORDER = {"Critical": 3, "High": 2, "Medium": 1, "Low": 0}
 YOLO_TARGETS = {"cell phone", "laptop", "credit card", "handbag", "backpack"}
+VISION_KEYWORDS = {
+    "credit card": "High",
+    "card": "Medium",
+    "laptop": "Medium",
+    "computer": "Medium",
+    "cell phone": "Medium",
+    "mobile phone": "Medium",
+    "smartphone": "Medium",
+    "gun": "High",
+    "firearm": "High",
+    "rifle": "High",
+    "handgun": "High",
+    "weapon": "High",
+}
 
 
 @dataclass
@@ -337,6 +361,8 @@ class EvidenceItem:
     findings: List[Finding] = field(default_factory=list)
     ocr_snippet: Optional[str] = None
     qr_data: Optional[str] = None
+    vision_objects: List[str] = field(default_factory=list)
+    vision_labels: List[str] = field(default_factory=list)
     geoint_link: Optional[str] = None
     entropy: Optional[float] = None
     stego_payload: Optional[str] = None
@@ -398,6 +424,59 @@ def configure_tesseract():
     windows_path = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
     if os.path.exists(windows_path):
         pytesseract.pytesseract.tesseract_cmd = windows_path
+
+
+def load_env():
+    # Load .env from repo root (same dir as this file) or cwd.
+    repo_env = os.path.join(os.path.dirname(__file__), ".env")
+    env_path = repo_env if os.path.exists(repo_env) else ".env"
+    if load_dotenv:
+        load_dotenv(env_path)
+    # Lightweight fallback parser to handle unquoted values with spaces.
+    if os.path.exists(env_path):
+        try:
+            with open(env_path, "r", encoding="utf-8") as handle:
+                for line in handle:
+                    line = line.strip()
+                    if not line or line.startswith("#") or "=" not in line:
+                        continue
+                    key, value = line.split("=", 1)
+                    key = key.strip()
+                    value = value.strip()
+                    if key and key not in os.environ:
+                        os.environ[key] = value.strip().strip('"')
+        except Exception:
+            pass
+
+
+def resolve_credentials_path() -> str:
+    raw = (os.environ.get("GOOGLE_APPLICATION_CREDENTIALS") or "").strip()
+    if raw.startswith('"') and raw.endswith('"'):
+        raw = raw[1:-1]
+    return os.path.expandvars(os.path.expanduser(raw))
+
+
+def ensure_inline_credentials():
+    inline_json = (os.environ.get("GOOGLE_APPLICATION_CREDENTIALS_JSON") or "").strip()
+    if not inline_json:
+        return
+    if inline_json.startswith('"') and inline_json.endswith('"'):
+        inline_json = inline_json[1:-1]
+    # Allow base64-encoded JSON to avoid escaping issues in .env.
+    if inline_json.lower().startswith("base64:"):
+        try:
+            inline_json = base64.b64decode(inline_json.split(":", 1)[1]).decode("utf-8")
+        except Exception:
+            return
+    if not inline_json.lstrip().startswith("{"):
+        return
+    creds_path = os.path.join(os.path.dirname(__file__), ".vision_credentials.json")
+    try:
+        with open(creds_path, "w", encoding="utf-8") as handle:
+            handle.write(inline_json)
+        os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = creds_path
+    except Exception:
+        return
 
 
 _easyocr_reader = None
@@ -551,6 +630,138 @@ def run_yolo(model, image_path: str, conf: float, imgsz: int) -> Tuple[List[str]
                     )
                 )
     return sorted(set(labels)), findings
+
+
+_vision_client = None
+
+
+def get_vision_client():
+    global _vision_client
+    if not vision:
+        return None
+    if _vision_client is None:
+        try:
+            _vision_client = vision.ImageAnnotatorClient()
+        except Exception:
+            _vision_client = None
+    return _vision_client
+
+
+def classify_vision_label(name: str) -> Optional[str]:
+    name_l = name.lower()
+    for keyword, severity in VISION_KEYWORDS.items():
+        if keyword in name_l:
+            return severity
+    return None
+
+
+def run_vision(
+    path: str,
+    min_score: float = 0.4,
+    debug: bool = False,
+) -> Tuple[Optional[str], List[str], List[str], List[Finding]]:
+    findings: List[Finding] = []
+    objects: List[str] = []
+    labels: List[str] = []
+    client = get_vision_client()
+    if not client:
+        return None, objects, labels, findings
+    try:
+        with open(path, "rb") as handle:
+            content = handle.read()
+    except Exception:
+        return None, objects, labels, findings
+    image = vision.Image(content=content)
+    try:
+        response = client.annotate_image(
+            {
+                "image": image,
+                "features": [
+                    {"type_": vision.Feature.Type.OBJECT_LOCALIZATION},
+                    {"type_": vision.Feature.Type.LABEL_DETECTION},
+                    {"type_": vision.Feature.Type.TEXT_DETECTION},
+                    {"type_": vision.Feature.Type.LOGO_DETECTION},
+                ],
+            }
+        )
+    except Exception as e:
+        if debug:
+            print_status("[WARN]", f"Vision API exception: {e}")
+        return None, objects, labels, findings
+    if response.error.message:
+        if debug:
+            print_status("[WARN]", f"Vision API error: {response.error.message}")
+        return None, objects, labels, findings
+
+    # Extract text (can contain QR code content if scanned)
+    payload = None
+    text_annotations = getattr(response, "text_annotations", None) or []
+    if text_annotations:
+        full_text = text_annotations[0].description if text_annotations else ""
+        if full_text:
+            # Check if text looks like QR/barcode data
+            if looks_like_url(full_text) or looks_like_crypto(full_text):
+                payload = full_text.strip()[:500]
+                severity = "High" if (looks_like_url(payload) or looks_like_crypto(payload)) else "Medium"
+                details = "URL" if looks_like_url(payload) else "Crypto/Other" if looks_like_crypto(payload) else "Text data"
+                findings.append(
+                    Finding(
+                        module="VISION",
+                        severity=severity,
+                        summary="Text/QR content found",
+                        details=f"{details}: {payload[:200]}",
+                    )
+                )
+
+    # Extract logos
+    for logo in getattr(response, "logo_annotations", None) or []:
+        if logo.score < min_score:
+            continue
+        name = logo.description or ""
+        if name:
+            labels.append(f"Logo: {name} ({logo.score:.2f})")
+
+    for obj in response.localized_object_annotations or []:
+        if obj.score < min_score:
+            continue
+        name = obj.name or ""
+        if name:
+            objects.append(name)
+            severity = classify_vision_label(name)
+            if severity:
+                findings.append(
+                    Finding(
+                        module="VISION",
+                        severity=severity,
+                        summary="Object detected",
+                        details=f"{name} ({obj.score:.2f})",
+                    )
+                )
+
+    label_items = response.label_annotations or []
+    if debug and not label_items and not response.localized_object_annotations:
+        print_status("[WARN]", "Vision API returned no labels/objects.")
+    for label in label_items:
+        if label.score < min_score:
+            continue
+        name = label.description or ""
+        if not name:
+            continue
+        labels.append(f"{name} ({label.score:.2f})")
+        severity = classify_vision_label(name)
+        if severity:
+            findings.append(
+                Finding(
+                    module="VISION",
+                    severity=severity,
+                    summary="Label detected",
+                    details=f"{name} ({label.score:.2f})",
+                )
+            )
+            if name not in objects:
+                objects.append(name)
+
+    return payload, sorted(set(objects)), labels, findings
 
 
 def dms_to_decimal(dms: Tuple, ref: str) -> Optional[float]:
@@ -733,7 +944,7 @@ def decode_stylesuxx_steganography(image_path: str) -> Optional[str]:
         from PIL import Image
         image = Image.open(image_path).convert("RGB")
         width, height = image.size
-        pixels = list(image.getdata())
+        pixels = list(image.get_flattened_data())
         
         # Extract binary message from RGB values (exact JavaScript algorithm)
         binary_message = ""
@@ -1275,13 +1486,17 @@ def collect_images(root: str) -> List[str]:
 
 
 def preflight_checks(yolo_model: str) -> Dict[str, bool]:
+    creds_path = resolve_credentials_path()
     status = {
         "ocr": bool(pytesseract or easyocr),
-        "qr": bool(pyzbar),
+        "qr": bool(pyzbar or cv2),  # OpenCV has built-in QRCodeDetector
         "yolo": bool(YOLO),
+        "vision": bool(vision and creds_path and os.path.exists(creds_path)),
         "geoint": True,
         "stego": bool(shannon_entropy),
     }
+    status["_vision_path"] = bool(creds_path)
+    status["_vision_exists"] = bool(creds_path and os.path.exists(creds_path))
     if status["ocr"]:
         try:
             if pytesseract:
@@ -1299,16 +1514,30 @@ def preflight_checks(yolo_model: str) -> Dict[str, bool]:
 
 def print_preflight(status: Dict[str, bool], yolo_model: str):
     print_status("[CHECK]", f"OCR available: {status['ocr']}")
-    print_status("[CHECK]", f"QR available: {status['qr']}")
+    qr_backend = "pyzbar" if pyzbar else ("OpenCV" if cv2 else "None")
+    print_status("[CHECK]", f"QR available: {status['qr']} ({qr_backend})")
     print_status("[CHECK]", f"YOLO available ({yolo_model}): {status['yolo']}")
+    print_status("[CHECK]", f"VISION available: {status['vision']}")
     print_status("[CHECK]", f"GEOINT available: {status['geoint']}")
     print_status("[CHECK]", f"STEGO available: {status['stego']}")
     if not status["ocr"]:
         print_status("[WARN]", "OCR disabled: install Tesseract or EasyOCR.")
     if not status["qr"]:
-        print_status("[WARN]", "QR disabled: install pyzbar and zbar.")
+        print_status("[WARN]", "QR disabled: install OpenCV or pyzbar.")
     if not status["yolo"]:
         print_status("[WARN]", "YOLO disabled: model failed to load.")
+    if not status["vision"]:
+        creds_value = resolve_credentials_path()
+        if not creds_value:
+            print_status(
+                "[WARN]",
+                "Vision disabled: GOOGLE_APPLICATION_CREDENTIALS is empty.",
+            )
+        else:
+            print_status(
+                "[WARN]",
+                f"Vision disabled: credentials not found at {creds_value}.",
+            )
     if not status["stego"]:
         print_status("[WARN]", "Stego disabled: install scikit-image.")
 
@@ -1320,12 +1549,15 @@ def run_scan(
     yolo_model: str,
     yolo_conf: float,
     yolo_imgsz: int,
+    vision_score: float,
+    use_vision: bool,
     debug: bool,
 ):
     if colorama_init:
         colorama_init()
     status = preflight_checks(yolo_model)
     print_preflight(status, yolo_model)
+    vision_enabled = use_vision and status["vision"]
     bip39_words = load_bip39(bip39_path)
     yolo_model_instance = load_yolo(yolo_model) if status["yolo"] else None
     files = collect_images(root)
@@ -1340,13 +1572,27 @@ def run_scan(
         item.ocr_snippet = ocr_snippet
         item.findings.extend(ocr_findings)
 
-        qr_data, qr_findings = run_qr(image_bgr if status["qr"] else None)
+        # Always try QR detection (OpenCV fallback works without pyzbar)
+        qr_data, qr_findings = run_qr(image_bgr)
         item.qr_data = qr_data
         item.findings.extend(qr_findings)
 
-        labels, yolo_findings = run_yolo(yolo_model_instance, path, yolo_conf, yolo_imgsz)
-        item.yolo_labels = labels
-        item.findings.extend(yolo_findings)
+        if vision_enabled:
+            vision_qr, vision_objects, vision_labels, vision_findings = run_vision(
+                path,
+                min_score=vision_score,
+                debug=debug,
+            )
+            # Use Vision QR if local QR detection didn't find anything
+            if vision_qr and not item.qr_data:
+                item.qr_data = vision_qr
+            item.vision_objects = vision_objects
+            item.vision_labels = vision_labels
+            item.findings.extend(vision_findings)
+        else:
+            labels, yolo_findings = run_yolo(yolo_model_instance, path, yolo_conf, yolo_imgsz)
+            item.yolo_labels = labels
+            item.findings.extend(yolo_findings)
 
         geoint_link, geoint_findings = run_geoint(path)
         item.geoint_link = geoint_link
@@ -1385,8 +1631,12 @@ def run_scan(
         if debug:
             print_status(
                 "[DEBUG]",
-                f"OCR:{bool(ocr_findings)} QR:{bool(qr_findings)} YOLO:{len(labels)} GEO:{bool(geoint_link)} STEGO:{entropy} DECODE:{bool(stego_payload)}",
+                f"OCR:{bool(ocr_findings)} QR:{bool(qr_data)} VISION:{len(item.vision_objects)} "
+                f"LABELS:{len(item.vision_labels)} YOLO:{len(item.yolo_labels)} GEO:{bool(geoint_link)} "
+                f"STEGO:{entropy} DECODE:{bool(stego_payload)}",
             )
+            if item.vision_labels and not item.vision_objects:
+                print_status("[DEBUG]", f"Vision labels: {', '.join(item.vision_labels[:6])}")
 
         items.append(item)
 
@@ -1456,6 +1706,18 @@ def parse_args() -> argparse.Namespace:
         help="YOLO inference size (default: 960)",
     )
     parser.add_argument(
+        "--vision-score",
+        type=float,
+        default=0.4,
+        help="Vision confidence threshold (default: 0.4)",
+    )
+    parser.add_argument(
+        "--vision",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use Google Vision API when available (default: true)",
+    )
+    parser.add_argument(
         "--debug",
         action="store_true",
         help="Print per-image module debug info",
@@ -1468,6 +1730,8 @@ def main() -> int:
     if not os.path.exists(args.path):
         print_status("[ERROR]", f"Path not found: {args.path}")
         return 1
+    load_env()
+    ensure_inline_credentials()
     configure_tesseract()
     run_scan(
         args.path,
@@ -1476,6 +1740,8 @@ def main() -> int:
         args.yolo,
         args.yolo_conf,
         args.yolo_imgsz,
+        args.vision_score,
+        args.vision,
         args.debug,
     )
     return 0
